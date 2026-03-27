@@ -5,6 +5,9 @@ LiquidityOS API Routes — REST endpoints for the commerce backend.
 from flask import Blueprint, request, jsonify, g
 from app.middleware.auth import require_auth, create_token
 from app.services import sellers, buyers, lots, pricing, offers
+from app.services import escrow as escrow_svc, invoices as invoice_svc
+from app.services import freight as freight_svc, fulfillment as fulfillment_svc
+from app.services import disputes as dispute_svc
 from app.services.audit import log_event
 
 api = Blueprint("api", __name__, url_prefix="/v1")
@@ -316,6 +319,225 @@ def list_orders():
 
 
 # ════════════════════════════════════════
+# ESCROW + PAYMENT
+# ════════════════════════════════════════
+
+@api.route("/orders/<order_id>/escrow", methods=["GET"])
+@require_auth("buyer", "seller", "ops")
+def get_escrow(order_id):
+    esc = escrow_svc.get_escrow_by_order(order_id)
+    if not esc:
+        return jsonify({"error": {"code": "NOT_FOUND"}}), 404
+    return jsonify(esc)
+
+
+@api.route("/orders/<order_id>/escrow/fund", methods=["POST"])
+@require_auth("buyer")
+def fund_escrow(order_id):
+    data = request.get_json() or {}
+    result = escrow_svc.fund_escrow(order_id, g.current_user_id, data)
+    if isinstance(result, dict) and "error" in result:
+        code = result["error"]
+        status = 400
+        if code == "ESCROW_NOT_FOUND":
+            status = 404
+        elif code == "NOT_AUTHORIZED":
+            status = 403
+        elif code == "FUNDING_DEADLINE_EXPIRED":
+            status = 410
+        return jsonify({"error": {"code": code, "message": result.get("message", "")}}), status
+
+    # Generate invoices on successful funding
+    from app.db import get_db, dict_from_row
+    with get_db() as conn:
+        order_row = conn.execute("SELECT * FROM orders WHERE order_id = ?", (order_id,)).fetchone()
+    if order_row:
+        order = dict_from_row(order_row)
+        invoice_svc.generate_invoices(order)
+
+    return jsonify(result)
+
+
+@api.route("/orders/<order_id>/invoices", methods=["GET"])
+@require_auth("buyer", "seller", "ops")
+def get_order_invoices(order_id):
+    invs = invoice_svc.get_invoices_by_order(order_id)
+    return jsonify({"invoices": invs})
+
+
+# ════════════════════════════════════════
+# FREIGHT + SHIPMENTS
+# ════════════════════════════════════════
+
+@api.route("/lots/<lot_id>/freight-quotes", methods=["POST"])
+@require_auth("buyer", "seller", "ops")
+def get_freight_quote(lot_id):
+    data = request.get_json() or {}
+    destination_zip = data.get("destination_zip")
+    if not destination_zip:
+        return jsonify({"error": {"code": "MISSING_FIELD", "message": "destination_zip required"}}), 400
+    result = freight_svc.get_freight_quote(lot_id, destination_zip, g.current_user_id)
+    if isinstance(result, dict) and "error" in result:
+        return jsonify({"error": {"code": result["error"]}}), 404
+    return jsonify(result), 201
+
+
+@api.route("/orders/<order_id>/shipment/book", methods=["POST"])
+@require_auth("seller", "ops")
+def book_shipment(order_id):
+    data = request.get_json() or {}
+    quote_id = data.get("quote_id")
+    if not quote_id:
+        return jsonify({"error": {"code": "MISSING_FIELD", "message": "quote_id required"}}), 400
+    selected_index = data.get("selected_option_index", 0)
+    result = freight_svc.book_shipment(order_id, quote_id, selected_index)
+    if isinstance(result, dict) and "error" in result:
+        return jsonify({"error": {"code": result["error"]}}), 400
+    return jsonify(result), 201
+
+
+@api.route("/orders/<order_id>/shipment", methods=["GET"])
+@require_auth("buyer", "seller", "ops")
+def get_shipment(order_id):
+    shipment = freight_svc.get_shipment_by_order(order_id)
+    if not shipment:
+        return jsonify({"error": {"code": "NOT_FOUND"}}), 404
+    return jsonify(shipment)
+
+
+@api.route("/shipments/<shipment_id>/tracking", methods=["POST"])
+@require_auth("seller", "ops")
+def add_tracking_event(shipment_id):
+    data = request.get_json()
+    if not data or "status" not in data:
+        return jsonify({"error": {"code": "MISSING_FIELD", "message": "status required"}}), 400
+    result = freight_svc.add_tracking_event(
+        shipment_id, data["status"], data.get("description", ""),
+        data.get("location_city"), data.get("location_state"), data.get("location_zip"),
+    )
+    if isinstance(result, dict) and "error" in result:
+        return jsonify({"error": {"code": result["error"]}}), 404
+    return jsonify(result), 201
+
+
+@api.route("/shipments/<shipment_id>/tracking", methods=["GET"])
+@require_auth("buyer", "seller", "ops")
+def get_tracking(shipment_id):
+    events = freight_svc.get_tracking_events(shipment_id)
+    return jsonify({"events": events})
+
+
+# ════════════════════════════════════════
+# INSPECTION + PAYOUT
+# ════════════════════════════════════════
+
+@api.route("/orders/<order_id>/inspect/accept", methods=["POST"])
+@require_auth("buyer")
+def accept_inspection(order_id):
+    result = fulfillment_svc.accept_inspection(order_id, g.current_user_id)
+    if isinstance(result, dict) and "error" in result:
+        code = result["error"]
+        status = 400
+        if code == "ORDER_NOT_FOUND":
+            status = 404
+        elif code == "NOT_AUTHORIZED":
+            status = 403
+        return jsonify({"error": {"code": code, "message": result.get("message", "")}}), status
+    return jsonify(result)
+
+
+@api.route("/orders/<order_id>/payout", methods=["GET"])
+@require_auth("seller", "ops")
+def get_payout(order_id):
+    payout = fulfillment_svc.get_payout_by_order(order_id)
+    if not payout:
+        return jsonify({"error": {"code": "NOT_FOUND"}}), 404
+    return jsonify(payout)
+
+
+# ════════════════════════════════════════
+# DISPUTES
+# ════════════════════════════════════════
+
+@api.route("/disputes", methods=["POST"])
+@require_auth("buyer")
+def create_dispute():
+    data = request.get_json()
+    required = ["order_id", "type", "description", "claimed_amount_cents"]
+    for field in required:
+        if field not in data:
+            return jsonify({"error": {"code": "MISSING_FIELD", "message": f"{field} required"}}), 400
+    result = dispute_svc.create_dispute(g.current_user_id, data)
+    if isinstance(result, dict) and "error" in result:
+        code = result["error"]
+        status = 400
+        if code == "ORDER_NOT_FOUND":
+            status = 404
+        elif code == "NOT_AUTHORIZED":
+            status = 403
+        return jsonify({"error": {"code": code, "message": result.get("message", "")}}), status
+    return jsonify(result), 201
+
+
+@api.route("/disputes/<dispute_id>", methods=["GET"])
+@require_auth("buyer", "seller", "ops")
+def get_dispute(dispute_id):
+    dispute = dispute_svc.get_dispute(dispute_id)
+    if not dispute:
+        return jsonify({"error": {"code": "NOT_FOUND"}}), 404
+    return jsonify(dispute)
+
+
+@api.route("/disputes", methods=["GET"])
+@require_auth("buyer", "seller", "ops")
+def list_disputes():
+    filters = {}
+    if g.current_role == "buyer":
+        filters["buyer_id"] = g.current_user_id
+    elif g.current_role == "seller":
+        filters["seller_id"] = g.current_user_id
+    elif request.args.get("status"):
+        filters["status"] = request.args.get("status")
+    return jsonify({"disputes": dispute_svc.list_disputes(filters)})
+
+
+@api.route("/disputes/<dispute_id>/respond", methods=["POST"])
+@require_auth("seller")
+def respond_to_dispute(dispute_id):
+    data = request.get_json()
+    if not data or "message" not in data:
+        return jsonify({"error": {"code": "MISSING_FIELD", "message": "message required"}}), 400
+    result = dispute_svc.respond_to_dispute(dispute_id, g.current_user_id, data)
+    if isinstance(result, dict) and "error" in result:
+        code = result["error"]
+        status = 400
+        if code == "DISPUTE_NOT_FOUND":
+            status = 404
+        elif code == "NOT_AUTHORIZED":
+            status = 403
+        return jsonify({"error": {"code": code, "message": result.get("message", "")}}), status
+    return jsonify(result)
+
+
+@api.route("/disputes/<dispute_id>/evidence", methods=["POST"])
+@require_auth("buyer", "seller")
+def add_dispute_evidence(dispute_id):
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": {"code": "BAD_REQUEST", "message": "evidence data required"}}), 400
+    result = dispute_svc.add_evidence(dispute_id, g.current_user_id, g.current_role, data)
+    if isinstance(result, dict) and "error" in result:
+        code = result["error"]
+        status = 400
+        if code == "DISPUTE_NOT_FOUND":
+            status = 404
+        elif code == "NOT_AUTHORIZED":
+            status = 403
+        return jsonify({"error": {"code": code, "message": result.get("message", "")}}), status
+    return jsonify(result)
+
+
+# ════════════════════════════════════════
 # ADMIN / OPS
 # ════════════════════════════════════════
 
@@ -339,6 +561,24 @@ def admin_verify_buyer(buyer_id):
     if not buyer:
         return jsonify({"error": {"code": "NOT_FOUND"}}), 404
     return jsonify(buyer)
+
+
+@api.route("/admin/disputes/<dispute_id>/resolve", methods=["POST"])
+@require_auth("ops")
+def admin_resolve_dispute(dispute_id):
+    data = request.get_json()
+    required = ["resolution_type", "reasoning"]
+    for field in required:
+        if field not in data:
+            return jsonify({"error": {"code": "MISSING_FIELD", "message": f"{field} required"}}), 400
+    result = dispute_svc.resolve_dispute(dispute_id, g.current_user_id, data)
+    if isinstance(result, dict) and "error" in result:
+        code = result["error"]
+        status = 400
+        if code == "DISPUTE_NOT_FOUND":
+            status = 404
+        return jsonify({"error": {"code": code, "message": result.get("message", "")}}), status
+    return jsonify(result)
 
 
 @api.route("/admin/dashboard", methods=["GET"])

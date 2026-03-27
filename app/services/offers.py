@@ -260,4 +260,13 @@ def _create_order(offer: dict, seller_id: str) -> dict:
 
     with get_db() as conn:
         row = conn.execute("SELECT * FROM orders WHERE order_id = ?", (order_id,)).fetchone()
+    order = dict_from_row(row)
+
+    # Auto-create escrow with 24h funding deadline
+    from app.services.escrow import create_escrow
+    create_escrow(order)
+
+    # Re-fetch order with escrow_id linked
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM orders WHERE order_id = ?", (order_id,)).fetchone()
     return dict_from_row(row)

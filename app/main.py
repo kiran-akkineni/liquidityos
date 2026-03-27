@@ -14,21 +14,39 @@ from app.db import init_db
 from app.routes.api import api
 
 
-def create_app():
+def create_app(init_database=True):
     app = Flask(__name__)
     app.config["JSON_SORT_KEYS"] = False
 
     # Register blueprints
     app.register_blueprint(api)
 
+    # Global error handlers
+    @app.errorhandler(400)
+    def bad_request(e):
+        return {"error": {"code": "BAD_REQUEST", "message": str(e)}}, 400
+
+    @app.errorhandler(404)
+    def not_found(e):
+        return {"error": {"code": "NOT_FOUND", "message": "Resource not found"}}, 404
+
+    @app.errorhandler(405)
+    def method_not_allowed(e):
+        return {"error": {"code": "METHOD_NOT_ALLOWED", "message": str(e)}}, 405
+
+    @app.errorhandler(500)
+    def internal_error(e):
+        return {"error": {"code": "INTERNAL_ERROR", "message": "An unexpected error occurred"}}, 500
+
     # Initialize database
-    with app.app_context():
-        init_db()
+    if init_database:
+        with app.app_context():
+            init_db()
 
     return app
 
 
-app = create_app()
+app = create_app(init_database=True)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))

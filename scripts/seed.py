@@ -11,6 +11,9 @@ from app.db import init_db
 from app.db import get_db as db_conn
 from app.utils.helpers import make_id, now_iso, json_dumps
 from app.services import sellers, buyers, lots, pricing, offers
+from app.services import escrow as escrow_svc, invoices as invoice_svc
+from app.services import freight as freight_svc, fulfillment as fulfillment_svc
+from app.services import disputes as dispute_svc
 
 
 def seed():
@@ -237,22 +240,291 @@ def seed():
     print(f"   → Seller payout: ${order['seller_payout_cents']/100:,.2f}")
     print(f"   → Platform revenue: ${order['platform_revenue_cents']/100:,.2f}")
 
+    # ── Week 9: Escrow + Payment ──
+
+    order_id = order["order_id"]
+
+    print("\n11. Checking escrow created with order...")
+    esc = escrow_svc.get_escrow_by_order(order_id)
+    print(f"   → Escrow ID: {esc['escrow_id']}")
+    print(f"   → Status: {esc['status']}")
+    print(f"   → Total: ${esc['total_cents']/100:,.2f}")
+    print(f"   → Funding deadline: {esc['funding_deadline']}")
+
+    print("\n12. Buyer funds escrow...")
+    funded = escrow_svc.fund_escrow(order_id, buyer_id, {
+        "method": "card",
+        "reference": "tok_visa_4242",
+        "processor_txn_id": "pi_test_123456",
+    })
+    print(f"   → Escrow status: {funded['status']}")
+    print(f"   → Funded at: {funded['funded_at']}")
+
+    # Verify order transitioned
+    with db_conn() as conn:
+        updated_order = conn.execute("SELECT * FROM orders WHERE order_id = ?", (order_id,)).fetchone()
+    print(f"   → Order status: {updated_order['status']}")
+
+    print("\n13. Generating invoices...")
+    from app.db import dict_from_row
+    order_dict = dict_from_row(updated_order)
+    invs = invoice_svc.generate_invoices(order_dict)
+    buyer_inv = invs["buyer_invoice"]
+    seller_inv = invs["seller_invoice"]
+    print(f"   → Buyer invoice: {buyer_inv['invoice_id']} — ${buyer_inv['total_cents']/100:,.2f}")
+    print(f"   → Seller invoice: {seller_inv['invoice_id']} — ${seller_inv['total_cents']/100:,.2f}")
+
+    # ── Week 10: Freight + Delivery + Payout ──
+
+    print("\n14. Getting freight quotes...")
+    quote = freight_svc.get_freight_quote(lot_id, "75201", buyer_id)
+    options = quote["options"]
+    print(f"   → Quote ID: {quote['quote_id']}")
+    for i, opt in enumerate(options):
+        print(f"   → Option {i}: {opt['carrier_name']} — ${opt['cost_cents']/100:,.2f} ({opt['transit_days']}d)")
+
+    print("\n15. Booking shipment (cheapest option)...")
+    shipment = freight_svc.book_shipment(order_id, quote["quote_id"], 0)
+    shipment_id = shipment["shipment_id"]
+    print(f"   → Shipment ID: {shipment_id}")
+    print(f"   → Carrier: {shipment['carrier_name']}")
+    print(f"   → Tracking: {shipment['tracking_number']}")
+    print(f"   → Status: {shipment['status']}")
+
+    print("\n16. Simulating shipment lifecycle...")
+    # Picked up
+    freight_svc.add_tracking_event(shipment_id, "PICKED_UP", "Picked up from origin facility",
+                                    "Dallas", "TX", "75201")
+    freight_svc.update_order_shipped(order_id)
+    print("   → PICKED_UP — order status: SHIPPED")
+
+    # In transit
+    freight_svc.add_tracking_event(shipment_id, "IN_TRANSIT", "In transit to destination",
+                                    "Fort Worth", "TX", "76102")
+    print("   → IN_TRANSIT")
+
+    # Out for delivery
+    freight_svc.add_tracking_event(shipment_id, "OUT_FOR_DELIVERY", "Out for delivery",
+                                    "Dallas", "TX", "75201")
+    print("   → OUT_FOR_DELIVERY")
+
+    # Delivered (triggers inspection window)
+    result = freight_svc.add_tracking_event(shipment_id, "DELIVERED",
+                                             "Delivered — signed by S. Chen",
+                                             "Dallas", "TX", "75201")
+    print("   → DELIVERED — inspection window opened (48h)")
+
+    # Verify order is in INSPECTION status
+    with db_conn() as conn:
+        insp_order = dict_from_row(conn.execute("SELECT * FROM orders WHERE order_id = ?", (order_id,)).fetchone())
+    print(f"   → Order status: {insp_order['status']}")
+    print(f"   → Inspection closes: {insp_order['inspection_window_closes_at']}")
+
+    print("\n17. Buyer accepts inspection...")
+    accept_result = fulfillment_svc.accept_inspection(order_id, buyer_id)
+    print(f"   → Order status: {accept_result['order_status']}")
+    print(f"   → Inspection result: {accept_result['inspection_result']}")
+
+    payout = accept_result["payout"]
+    print(f"   → Payout ID: {payout['payout_id']}")
+    print(f"   → Payout amount: ${payout['amount_cents']/100:,.2f}")
+    print(f"   → Payout status: {payout['status']}")
+    print(f"   → Expected arrival: {payout['expected_arrival_date']}")
+
+    # Verify reputation events
+    with db_conn() as conn:
+        rep_count = conn.execute("SELECT COUNT(*) as c FROM reputation_events").fetchone()["c"]
+        seller_score = conn.execute("SELECT quality_score FROM sellers WHERE seller_id = ?", (seller_id,)).fetchone()["quality_score"]
+        buyer_score = conn.execute("SELECT trust_score FROM buyers WHERE buyer_id = ?", (buyer_id,)).fetchone()["trust_score"]
+    print(f"\n18. Reputation updated:")
+    print(f"   → Seller quality_score: {seller_score} (+2)")
+    print(f"   → Buyer trust_score: {buyer_score} (+2)")
+    print(f"   → Reputation events: {rep_count}")
+
+    # Verify escrow released
+    final_escrow = escrow_svc.get_escrow_by_order(order_id)
+    print(f"\n19. Escrow status: {final_escrow['status']}")
+
+    # Verify lot sold
+    final_lot = lots.get_lot(lot_id)
+    print(f"   → Lot status: {final_lot['status']}")
+
+    # ══════════════════════════════════════════════════════════
+    # TRANSACTION 2: Dispute Flow
+    # ══════════════════════════════════════════════════════════
+
     print("\n" + "=" * 60)
-    print("SEED COMPLETE — Full negotiation flow executed:")
-    print(f"  Seller: {seller_id}")
-    print(f"  Buyer:  {buyer_id}")
-    print(f"  Lot:    {lot_id}")
-    print(f"  Offer:  {offer_id} → countered → accepted")
-    print(f"  Order:  {order['order_id']}")
+    print("TRANSACTION 2: Dispute scenario")
+    print("=" * 60)
+
+    print("\n20. Creating second lot...")
+    lot2 = lots.create_lot(seller_id, {
+        "title": "Mixed Electronics – 85 units, 1 pallet",
+        "description": "Overstock lot. Consumer electronics. Some units missing accessories.",
+        "total_units": 85,
+        "total_skus": 28,
+        "total_weight_lb": 920,
+        "total_cube_cuft": 48,
+        "pallet_count": 1,
+        "packing_type": "pallet",
+        "estimated_retail_value_cents": 820000,
+        "total_cost_cents": 120000,
+        "condition_distribution": {"NEW": 0.40, "LIKE_NEW": 0.35, "GOOD": 0.25},
+        "condition_primary": "LIKE_NEW",
+        "category_primary": "electronics",
+        "top_brands": ["Sony", "JBL", "Anker"],
+        "ship_from_zip": "75201",
+        "ship_from_state": "TX",
+        "ship_from_city": "Dallas",
+    })
+    lot2_id = lot2["lot_id"]
+    lot2 = lots.activate_lot(lot2_id, seller_id, {
+        "mode": "MAKE_OFFER",
+        "ask_price_cents": 180000,
+        "floor_price_cents": 140000,
+    })
+    print(f"   → Lot ID: {lot2_id} (ACTIVE, ask: $1,800)")
+
+    print("\n21. Buyer places offer at ask price...")
+    offer2_result = offers.create_offer(buyer_id, {
+        "lot_id": lot2_id,
+        "offer_type": "ACCEPT_ASK",
+        "offered_price_cents": 180000,
+    })
+    order2 = offer2_result["order"]
+    order2_id = order2["order_id"]
+    print(f"   → Order ID: {order2_id} (AWAITING_PAYMENT)")
+
+    print("\n22. Buyer funds escrow...")
+    esc2 = escrow_svc.get_escrow_by_order(order2_id)
+    escrow_svc.fund_escrow(order2_id, buyer_id, {"method": "ach", "reference": "ach_transfer_002"})
+    print(f"   → Escrow {esc2['escrow_id']} → FUNDED")
+
+    # Generate invoices
+    with db_conn() as conn:
+        order2_row = dict_from_row(conn.execute("SELECT * FROM orders WHERE order_id = ?", (order2_id,)).fetchone())
+    invoice_svc.generate_invoices(order2_row)
+
+    print("\n23. Shipping + delivery...")
+    quote2 = freight_svc.get_freight_quote(lot2_id, "75201", buyer_id)
+    ship2 = freight_svc.book_shipment(order2_id, quote2["quote_id"], 0)
+    ship2_id = ship2["shipment_id"]
+    freight_svc.add_tracking_event(ship2_id, "PICKED_UP", "Picked up", "Dallas", "TX", "75201")
+    freight_svc.update_order_shipped(order2_id)
+    freight_svc.add_tracking_event(ship2_id, "IN_TRANSIT", "In transit", "Dallas", "TX", "75201")
+    freight_svc.add_tracking_event(ship2_id, "DELIVERED", "Delivered", "Dallas", "TX", "75201")
+    print(f"   → Shipment {ship2_id} → DELIVERED")
+    print(f"   → Order → INSPECTION (48h window)")
+
+    # ── Dispute Flow ──
+
+    print("\n24. Buyer files dispute: CONDITION_MISMATCH...")
+    dispute = dispute_svc.create_dispute(buyer_id, {
+        "order_id": order2_id,
+        "type": "CONDITION_MISMATCH",
+        "description": "15 units listed as NEW are clearly used/opened. Missing accessories on 8 units.",
+        "affected_units": 23,
+        "total_units": 85,
+        "claimed_amount_cents": 50000,
+        "evidence": [
+            {"type": "photo", "url": "s3://evidence/photo_001.jpg", "description": "Opened packaging"},
+            {"type": "photo", "url": "s3://evidence/photo_002.jpg", "description": "Missing cables"},
+        ],
+    })
+    dispute_id = dispute["dispute_id"]
+    print(f"   → Dispute ID: {dispute_id}")
+    print(f"   → Status: {dispute['status']}")
+    print(f"   → Claimed: ${dispute['claimed_amount_cents']/100:,.2f}")
+    print(f"   → Seller response deadline: {dispute['seller_response_deadline']}")
+
+    # Check escrow is held
+    esc2_held = escrow_svc.get_escrow(esc2["escrow_id"])
+    print(f"   → Escrow status: {esc2_held['status']} (held for dispute)")
+
+    # Check order is DISPUTED
+    with db_conn() as conn:
+        disp_order = dict_from_row(conn.execute("SELECT * FROM orders WHERE order_id = ?", (order2_id,)).fetchone())
+    print(f"   → Order status: {disp_order['status']}")
+
+    print("\n25. Seller responds to dispute...")
+    dispute = dispute_svc.respond_to_dispute(dispute_id, seller_id, {
+        "message": "We acknowledge some units may have been miscategorized. Willing to offer partial refund.",
+        "evidence": [
+            {"type": "document", "url": "s3://evidence/qa_report.pdf", "description": "QA inspection report"},
+        ],
+        "proposed_resolution": "PARTIAL_REFUND",
+        "proposed_refund_cents": 35000,
+    })
+    print(f"   → Dispute status: {dispute['status']}")
+    print(f"   → Seller proposed: PARTIAL_REFUND of ${35000/100:,.2f}")
+
+    print("\n26. Buyer adds additional evidence...")
+    dispute = dispute_svc.add_evidence(dispute_id, buyer_id, "buyer", {
+        "type": "video",
+        "url": "s3://evidence/unboxing_video.mp4",
+        "description": "Unboxing video showing condition of received units",
+    })
+    evidence_count = len(dispute.get("buyer_evidence", []))
+    print(f"   → Total evidence items: {evidence_count}")
+
+    print("\n27. Ops resolves dispute: PARTIAL_REFUND...")
+    resolution = dispute_svc.resolve_dispute(dispute_id, "ops_admin", {
+        "resolution_type": "PARTIAL_REFUND",
+        "refund_amount_cents": 40000,
+        "reasoning": "Evidence confirms 15 units mislabeled as NEW. Awarding partial refund of $400 (proportional to affected units).",
+    })
+    resolved_dispute = resolution["dispute"]
+    res = resolution["resolution"]
+    print(f"   → Dispute status: {resolved_dispute['status']}")
+    print(f"   → Resolution: {res['resolution_type']}")
+    print(f"   → Refund: ${res['refund_amount_cents']/100:,.2f} to buyer")
+    print(f"   → Resolution ID: {res['resolution_id']}")
+
+    # Check final escrow status
+    esc2_final = escrow_svc.get_escrow(esc2["escrow_id"])
+    print(f"   → Escrow status: {esc2_final['status']}")
+
+    # Check reputation impacts
+    with db_conn() as conn:
+        seller_score_final = conn.execute("SELECT quality_score, dispute_rate_pct FROM sellers WHERE seller_id = ?",
+                                           (seller_id,)).fetchone()
+        buyer_score_final = conn.execute("SELECT trust_score FROM buyers WHERE buyer_id = ?",
+                                          (buyer_id,)).fetchone()
+        rep_count = conn.execute("SELECT COUNT(*) as c FROM reputation_events").fetchone()["c"]
+
+    print(f"\n28. Final reputation scores:")
+    print(f"   → Seller quality_score: {seller_score_final['quality_score']} (dispute impact: -1 filed, -2 resolved against)")
+    print(f"   → Seller dispute_rate: {seller_score_final['dispute_rate_pct']}%")
+    print(f"   → Buyer trust_score: {buyer_score_final['trust_score']} (+1 resolved in favor)")
+    print(f"   → Total reputation events: {rep_count}")
+
+    print("\n" + "=" * 60)
+    print("SEED COMPLETE — Two full transactions:")
+    print(f"")
+    print(f"  TRANSACTION 1 (happy path):")
+    print(f"    Lot:       {lot_id} → SOLD")
+    print(f"    Order:     {order_id} → COMPLETED")
+    print(f"    Escrow:    {esc['escrow_id']} → RELEASED")
+    print(f"    Payout:    {payout['payout_id']} → ${payout['amount_cents']/100:,.2f}")
+    print(f"")
+    print(f"  TRANSACTION 2 (dispute path):")
+    print(f"    Lot:       {lot2_id}")
+    print(f"    Order:     {order2_id} → DISPUTED")
+    print(f"    Dispute:   {dispute_id} → RESOLVED (PARTIAL_REFUND $400)")
+    print(f"    Escrow:    {esc2['escrow_id']} → {esc2_final['status']}")
+    print(f"")
+    print(f"  Seller: {seller_id} (score: {seller_score_final['quality_score']})")
+    print(f"  Buyer:  {buyer_id} (score: {buyer_score_final['trust_score']})")
     print("=" * 60)
 
     # Print dashboard stats
-    from app.db import get_db
     with db_conn() as conn:
         print("\nDatabase stats:")
         for table in ["sellers", "buyers", "buyer_intent_profiles", "canonical_products",
                        "lots", "lot_line_items", "normalized_line_items", "offers",
-                       "counter_offers", "orders", "audit_log"]:
+                       "counter_offers", "orders", "escrow_transactions", "invoices",
+                       "shipments", "tracking_events", "payouts", "reputation_events",
+                       "disputes", "resolutions", "audit_log"]:
             count = conn.execute(f"SELECT COUNT(*) as c FROM {table}").fetchone()["c"]
             print(f"  {table}: {count} rows")
 
