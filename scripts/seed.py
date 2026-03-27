@@ -15,6 +15,7 @@ from app.services import escrow as escrow_svc, invoices as invoice_svc
 from app.services import freight as freight_svc, fulfillment as fulfillment_svc
 from app.services import disputes as dispute_svc
 from app.services import ingestion as ingestion_svc
+from app.services import buyer_agent as agent_svc
 
 
 def seed():
@@ -621,6 +622,88 @@ def seed():
                 print(f"   → Est. retail: ${ing_stats['estimated_retail_cents']/100:,.2f}")
                 print(f"   → Condition: {ing_stats['condition_distribution']}")
                 print(f"   → Top brands: {', '.join(ing_stats['top_brands'][:4])}")
+
+    # ══════════════════════════════════════════════════════════
+    # LLM BUYER AGENT
+    # ══════════════════════════════════════════════════════════
+
+    print("\n" + "=" * 60)
+    print("LLM BUYER AGENT")
+    print("=" * 60)
+
+    # The ingestion pipeline created lot_73f... — let's activate it and have the agent evaluate it
+    # Use the existing ingestion lot (lot3) if it was created
+    # Get the ingestion-created lot (DRAFT) and activate it for agent evaluation
+    with db_conn() as conn:
+        draft_lots = conn.execute(
+            "SELECT lot_id, title FROM lots WHERE status = 'DRAFT' AND deleted_at IS NULL"
+        ).fetchall()
+
+    agent_lot_id = None
+    agent_lot_title = None
+    for dl in draft_lots:
+        dl = dict(dl)
+        lots.activate_lot(dl["lot_id"], seller_id, {
+            "mode": "MAKE_OFFER",
+            "ask_price_cents": 250000,
+            "floor_price_cents": 180000,
+        })
+        agent_lot_id = dl["lot_id"]
+        agent_lot_title = dl["title"]
+
+    if agent_lot_id:
+
+        print(f"\n33. Agent evaluating lot: {agent_lot_title[:50]}...")
+        evaluation = agent_svc.evaluate_lot(buyer_id, agent_lot_id)
+        if "error" not in evaluation:
+            print(f"   → Composite score: {evaluation['composite_score']}")
+            print(f"   → Action: {evaluation['action']}")
+            print(f"   → Reasoning: {evaluation['reasoning'][:120]}...")
+            for dim, score_data in evaluation["scores"].items():
+                print(f"   → {dim:12s}: {score_data['score']:.2f} ({score_data['signal']})")
+
+            print(f"\n34. Agent generating auto-offer...")
+            offer_result = agent_svc.generate_auto_offer(buyer_id, agent_lot_id, execute=True)
+            if "error" not in offer_result:
+                print(f"   → Recommendation: {offer_result['recommendation']}")
+                if offer_result.get("offer_price_cents"):
+                    print(f"   → Offer price: ${offer_result['offer_price_cents']/100:,.2f}")
+                    print(f"   → Strategy: {offer_result.get('strategy', '?')}")
+                print(f"   → Reasoning: {offer_result['reasoning'][:120]}...")
+                if offer_result.get("executed"):
+                    offer_obj = offer_result["offer"]
+                    agent_offer_id = offer_obj.get("offer_id", offer_obj.get("offer", {}).get("offer_id"))
+                    print(f"   → Offer placed! ID: {agent_offer_id}")
+
+                    # Seller counters the agent's offer
+                    if agent_offer_id:
+                        print(f"\n35. Seller counters the agent's offer...")
+                        counter_result = offers.counter_offer(agent_offer_id, seller_id, 230000,
+                                                               "Best I can do is $2,300.")
+                        if "error" not in counter_result:
+                            agent_counter_id = counter_result["counter"]["counter_id"]
+                            print(f"   → Counter: ${230000/100:,.2f}")
+
+                            print(f"\n36. Agent deciding on counter-offer...")
+                            decision = agent_svc.decide_counter(buyer_id, agent_counter_id)
+                            print(f"   → Decision: {decision['decision']}")
+                            print(f"   → Margin at counter: {decision['margin_at_counter_pct']}%")
+                            print(f"   → Target margin: {decision['target_margin_pct']}%")
+                            print(f"   → Reasoning: {decision['reasoning'][:120]}...")
+                        else:
+                            print(f"   → Counter error: {counter_result.get('error')}")
+            else:
+                print(f"   → Error: {offer_result.get('error')}")
+
+        print(f"\n37. Agent scanning all active lots for recommendations...")
+        recs = agent_svc.scan_recommendations(buyer_id)
+        if "error" not in recs:
+            print(f"   → Lots scanned: {recs['lots_scanned']}")
+            print(f"   → Recommendations: {len(recs['recommendations'])}")
+            for r in recs["recommendations"][:3]:
+                print(f"   → [{r['action']:11s}] {r['composite_score']:.2f}  {r['title'][:50]}")
+    else:
+        print("   → No active lots to evaluate")
 
     print("\n" + "=" * 60)
     print("SEED COMPLETE:")

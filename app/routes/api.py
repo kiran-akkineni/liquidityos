@@ -9,6 +9,7 @@ from app.services import escrow as escrow_svc, invoices as invoice_svc
 from app.services import freight as freight_svc, fulfillment as fulfillment_svc
 from app.services import disputes as dispute_svc
 from app.services import ingestion as ingestion_svc
+from app.services import buyer_agent as agent_svc
 from app.services.audit import log_event
 
 api = Blueprint("api", __name__, url_prefix="/v1")
@@ -454,6 +455,61 @@ def get_payout(order_id):
     if not payout:
         return jsonify({"error": {"code": "NOT_FOUND"}}), 404
     return jsonify(payout)
+
+
+# ════════════════════════════════════════
+# BUYER AGENT
+# ════════════════════════════════════════
+
+@api.route("/agent/evaluate-lot", methods=["POST"])
+@require_auth("buyer")
+def agent_evaluate_lot():
+    data = request.get_json()
+    if not data or "lot_id" not in data:
+        return jsonify({"error": {"code": "MISSING_FIELD", "message": "lot_id required"}}), 400
+    result = agent_svc.evaluate_lot(g.current_user_id, data["lot_id"], data.get("profile_id"))
+    if isinstance(result, dict) and "error" in result:
+        return jsonify({"error": {"code": result["error"]}}), 400
+    return jsonify(result)
+
+
+@api.route("/agent/auto-offer", methods=["POST"])
+@require_auth("buyer")
+def agent_auto_offer():
+    data = request.get_json()
+    if not data or "lot_id" not in data:
+        return jsonify({"error": {"code": "MISSING_FIELD", "message": "lot_id required"}}), 400
+    execute = data.get("execute", False)
+    result = agent_svc.generate_auto_offer(
+        g.current_user_id, data["lot_id"], data.get("profile_id"), execute=execute
+    )
+    if isinstance(result, dict) and "error" in result:
+        return jsonify({"error": {"code": result["error"]}}), 400
+    status_code = 201 if result.get("executed") else 200
+    return jsonify(result), status_code
+
+
+@api.route("/agent/counter-decision", methods=["POST"])
+@require_auth("buyer")
+def agent_counter_decision():
+    data = request.get_json()
+    if not data or "counter_id" not in data:
+        return jsonify({"error": {"code": "MISSING_FIELD", "message": "counter_id required"}}), 400
+    result = agent_svc.decide_counter(g.current_user_id, data["counter_id"], data.get("profile_id"))
+    if isinstance(result, dict) and "error" in result:
+        return jsonify({"error": {"code": result["error"]}}), 400
+    return jsonify(result)
+
+
+@api.route("/agent/recommendations", methods=["GET"])
+@require_auth("buyer")
+def agent_recommendations():
+    profile_id = request.args.get("profile_id")
+    limit = _int_param("limit", 10)
+    result = agent_svc.scan_recommendations(g.current_user_id, profile_id, limit)
+    if isinstance(result, dict) and "error" in result:
+        return jsonify({"error": {"code": result["error"]}}), 400
+    return jsonify(result)
 
 
 # ════════════════════════════════════════

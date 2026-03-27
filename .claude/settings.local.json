@@ -6,6 +6,7 @@
       "Bash(git commit:*)",
       "Bash(python3 scripts/seed.py)",
       "Bash(python3:*)"
-    ]
+    ],
+    "defaultMode": "bypassPermissions"
   }
 }
