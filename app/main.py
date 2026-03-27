@@ -18,6 +18,14 @@ def create_app(init_database=True):
     app = Flask(__name__)
     app.config["JSON_SORT_KEYS"] = False
 
+    # CORS — allow frontend dev server
+    @app.after_request
+    def add_cors_headers(response):
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+        response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+        return response
+
     # Register blueprints
     app.register_blueprint(api)
 

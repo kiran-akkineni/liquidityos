@@ -8,6 +8,7 @@ from app.services import sellers, buyers, lots, pricing, offers
 from app.services import escrow as escrow_svc, invoices as invoice_svc
 from app.services import freight as freight_svc, fulfillment as fulfillment_svc
 from app.services import disputes as dispute_svc
+from app.services import ingestion as ingestion_svc
 from app.services.audit import log_event
 
 api = Blueprint("api", __name__, url_prefix="/v1")
@@ -456,6 +457,80 @@ def get_payout(order_id):
 
 
 # ════════════════════════════════════════
+# INVENTORY INGESTION
+# ════════════════════════════════════════
+
+@api.route("/inventory/upload", methods=["POST"])
+@require_auth("seller")
+def upload_manifest():
+    import tempfile, os
+    if "file" not in request.files:
+        return jsonify({"error": {"code": "MISSING_FILE", "message": "file field required (multipart)"}}), 400
+    f = request.files["file"]
+    if not f.filename:
+        return jsonify({"error": {"code": "MISSING_FILE", "message": "No file selected"}}), 400
+
+    ext = f.filename.rsplit(".", 1)[-1].lower() if "." in f.filename else ""
+    if ext not in ("xlsx", "xls", "csv"):
+        return jsonify({"error": {"code": "UNSUPPORTED_FILE", "message": "Supported: xlsx, xls, csv"}}), 400
+
+    # Save to temp file
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}")
+    f.save(tmp)
+    tmp.close()
+
+    # Create job
+    job = ingestion_svc.create_ingestion_job(g.current_user_id, tmp.name, f.filename, ext)
+
+    # Run pipeline synchronously (async in production)
+    result = ingestion_svc.run_pipeline(job["job_id"])
+    if isinstance(result, dict) and "error" in result:
+        return jsonify({"error": {"code": result["error"], "message": result.get("message", "")}}), 400
+
+    return jsonify(result), 201
+
+
+@api.route("/inventory/jobs", methods=["GET"])
+@require_auth("seller", "ops")
+def list_ingestion_jobs():
+    seller_id = g.current_user_id if g.current_role == "seller" else None
+    jobs = ingestion_svc.list_jobs(seller_id=seller_id)
+    return jsonify({"jobs": jobs})
+
+
+@api.route("/inventory/jobs/<job_id>", methods=["GET"])
+@require_auth("seller", "ops")
+def get_ingestion_job(job_id):
+    job = ingestion_svc.get_job(job_id)
+    if not job:
+        return jsonify({"error": {"code": "NOT_FOUND"}}), 404
+    return jsonify(job)
+
+
+@api.route("/inventory/jobs/<job_id>/items", methods=["GET"])
+@require_auth("seller", "ops")
+def get_ingestion_items(job_id):
+    items = ingestion_svc.get_job_items(job_id)
+    return jsonify({"items": items, "count": len(items)})
+
+
+@api.route("/inventory/jobs/<job_id>/create-lot", methods=["POST"])
+@require_auth("seller")
+def create_lot_from_job(job_id):
+    data = request.get_json() or {}
+    result = ingestion_svc.create_lot_from_job(job_id, g.current_user_id, data)
+    if isinstance(result, dict) and "error" in result:
+        code = result["error"]
+        status = 400
+        if code == "JOB_NOT_FOUND":
+            status = 404
+        elif code == "NOT_AUTHORIZED":
+            status = 403
+        return jsonify({"error": {"code": code, "message": result.get("message", "")}}), status
+    return jsonify(result), 201
+
+
+# ════════════════════════════════════════
 # DISPUTES
 # ════════════════════════════════════════
 
@@ -579,6 +654,103 @@ def admin_resolve_dispute(dispute_id):
             status = 404
         return jsonify({"error": {"code": code, "message": result.get("message", "")}}), status
     return jsonify(result)
+
+
+@api.route("/admin/sellers", methods=["GET"])
+@require_auth("ops")
+def admin_list_sellers():
+    from app.db import get_db, rows_to_dicts
+    status = request.args.get("status")
+    limit = _int_param("limit", 100)
+    with get_db() as conn:
+        if status:
+            rows = conn.execute(
+                "SELECT * FROM sellers WHERE deleted_at IS NULL AND status = ? ORDER BY created_at DESC LIMIT ?",
+                (status, limit)).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM sellers WHERE deleted_at IS NULL ORDER BY created_at DESC LIMIT ?",
+                (limit,)).fetchall()
+    return jsonify({"sellers": rows_to_dicts(rows)})
+
+
+@api.route("/admin/buyers", methods=["GET"])
+@require_auth("ops")
+def admin_list_buyers():
+    from app.db import get_db, rows_to_dicts
+    status = request.args.get("status")
+    limit = _int_param("limit", 100)
+    with get_db() as conn:
+        if status:
+            rows = conn.execute(
+                "SELECT * FROM buyers WHERE deleted_at IS NULL AND status = ? ORDER BY created_at DESC LIMIT ?",
+                (status, limit)).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM buyers WHERE deleted_at IS NULL ORDER BY created_at DESC LIMIT ?",
+                (limit,)).fetchall()
+    return jsonify({"buyers": rows_to_dicts(rows)})
+
+
+@api.route("/admin/lots", methods=["GET"])
+@require_auth("ops")
+def admin_list_lots():
+    from app.db import get_db, rows_to_dicts
+    status = request.args.get("status")
+    limit = _int_param("limit", 100)
+    with get_db() as conn:
+        if status:
+            rows = conn.execute(
+                "SELECT * FROM lots WHERE deleted_at IS NULL AND status = ? ORDER BY created_at DESC LIMIT ?",
+                (status, limit)).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM lots WHERE deleted_at IS NULL ORDER BY created_at DESC LIMIT ?",
+                (limit,)).fetchall()
+    return jsonify({"lots": rows_to_dicts(rows)})
+
+
+@api.route("/admin/orders", methods=["GET"])
+@require_auth("ops")
+def admin_list_orders():
+    from app.db import get_db, rows_to_dicts
+    status = request.args.get("status")
+    limit = _int_param("limit", 100)
+    with get_db() as conn:
+        if status:
+            rows = conn.execute(
+                "SELECT * FROM orders WHERE status = ? ORDER BY created_at DESC LIMIT ?",
+                (status, limit)).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM orders ORDER BY created_at DESC LIMIT ?",
+                (limit,)).fetchall()
+    return jsonify({"orders": rows_to_dicts(rows)})
+
+
+@api.route("/admin/ingestion-jobs", methods=["GET"])
+@require_auth("ops")
+def admin_list_ingestion_jobs():
+    jobs = ingestion_svc.list_jobs()
+    return jsonify({"jobs": jobs})
+
+
+@api.route("/admin/disputes", methods=["GET"])
+@require_auth("ops")
+def admin_list_disputes():
+    from app.db import get_db, rows_to_dicts
+    status = request.args.get("status")
+    limit = _int_param("limit", 100)
+    with get_db() as conn:
+        if status:
+            rows = conn.execute(
+                "SELECT * FROM disputes WHERE status = ? ORDER BY created_at DESC LIMIT ?",
+                (status, limit)).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM disputes ORDER BY created_at DESC LIMIT ?",
+                (limit,)).fetchall()
+    return jsonify({"disputes": rows_to_dicts(rows)})
 
 
 @api.route("/admin/dashboard", methods=["GET"])
