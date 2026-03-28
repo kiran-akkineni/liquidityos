@@ -21,8 +21,6 @@ COPY scripts/ ./scripts/
 COPY --from=frontend-build /app/frontend/dist ./frontend/dist
 
 # Runtime config
-ENV PORT=8000
 ENV PYTHONUNBUFFERED=1
-EXPOSE 8000
 
 CMD ["python3", "scripts/start.py"]
