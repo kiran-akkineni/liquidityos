@@ -25,4 +25,4 @@ ENV PORT=8000
 ENV PYTHONUNBUFFERED=1
 EXPOSE 8000
 
-CMD ["sh", "-c", "python3 scripts/prod_seed.py; exec gunicorn --bind 0.0.0.0:${PORT:-8000} --workers 2 --timeout 120 app.main:app"]
+CMD ["python3", "scripts/start.py"]
