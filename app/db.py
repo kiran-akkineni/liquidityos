@@ -135,16 +135,31 @@ def _schema_sqlite_to_pg(sql: str) -> str:
 def init_db():
     """Run schema migration to create all tables."""
     from migrations.schema import SCHEMA_SQL
+    backend = "postgres" if is_postgres() else "sqlite"
+    target = _get_database_url().split("@")[-1].split("?")[0] if is_postgres() else DB_PATH
     try:
-        with get_db() as conn:
-            conn.executescript(SCHEMA_SQL)
-        backend = "postgres" if is_postgres() else "sqlite"
-        target = _get_database_url().split("@")[-1].split("?")[0] if is_postgres() else DB_PATH
-        logger.info("Database initialized (%s: %s)", backend, target)
-        print(f"Database initialized ({backend}: {target})")
+        if is_postgres():
+            # For Postgres, strip PRAGMA lines and execute as one block
+            schema = _schema_sqlite_to_pg(SCHEMA_SQL)
+            conn = _get_pg_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute(schema)
+                conn.commit()
+                cur.close()
+            except Exception as e:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+        else:
+            with get_db() as conn:
+                conn.executescript(SCHEMA_SQL)
+        print(f"Database initialized ({backend}: {target})", flush=True)
     except Exception as e:
-        logger.error("Database initialization failed: %s", e)
-        print(f"ERROR: Database initialization failed: {e}")
+        print(f"ERROR: Database initialization failed ({backend}): {e}", flush=True)
+        import traceback
+        traceback.print_exc()
         raise
 
 

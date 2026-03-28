@@ -11,29 +11,57 @@ import traceback
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 print("prod_seed.py: starting", flush=True)
-print(f"prod_seed.py: DATABASE_URL={'set' if os.environ.get('DATABASE_URL') else 'not set'}", flush=True)
+print(f"prod_seed.py: Python {sys.version}", flush=True)
+print(f"prod_seed.py: cwd={os.getcwd()}", flush=True)
+print(f"prod_seed.py: DATABASE_URL={'set (' + os.environ['DATABASE_URL'].split('@')[-1] + ')' if os.environ.get('DATABASE_URL') else 'NOT SET (using sqlite)'}", flush=True)
 print(f"prod_seed.py: PORT={os.environ.get('PORT', 'not set')}", flush=True)
+
+# ── Step 0: Raw connection test before importing any app code ──
+database_url = os.environ.get("DATABASE_URL")
+if database_url:
+    print("prod_seed.py: testing raw psycopg2 connection...", flush=True)
+    try:
+        import psycopg2
+        url = database_url
+        if url.startswith("postgres://"):
+            url = url.replace("postgres://", "postgresql://", 1)
+        conn = psycopg2.connect(url)
+        cur = conn.cursor()
+        cur.execute("SELECT 1")
+        result = cur.fetchone()
+        print(f"prod_seed.py: Postgres connection OK (SELECT 1 = {result[0]})", flush=True)
+        cur.close()
+        conn.close()
+    except ImportError:
+        print("prod_seed.py: ERROR — psycopg2 not installed!", flush=True)
+        traceback.print_exc()
+    except Exception as e:
+        print(f"prod_seed.py: ERROR — Postgres connection failed: {e}", flush=True)
+        traceback.print_exc()
+else:
+    print("prod_seed.py: no DATABASE_URL, will use SQLite", flush=True)
 
 
 def prod_seed():
+    # ── Step 1: Import app modules ──
     try:
         from app.db import init_db, get_db, is_postgres
-        print(f"prod_seed.py: using {'postgres' if is_postgres() else 'sqlite'}", flush=True)
+        print(f"prod_seed.py: app modules imported, using {'postgres' if is_postgres() else 'sqlite'}", flush=True)
     except Exception as e:
-        print(f"prod_seed.py: FAILED to import db module: {e}", flush=True)
+        print(f"prod_seed.py: FAILED to import app modules: {e}", flush=True)
         traceback.print_exc()
         return
 
-    # Initialize schema
+    # ── Step 2: Initialize schema ──
     try:
         init_db()
-        print("prod_seed.py: schema initialized", flush=True)
+        print("prod_seed.py: schema initialized OK", flush=True)
     except Exception as e:
-        print(f"prod_seed.py: schema init failed (will retry on app start): {e}", flush=True)
+        print(f"prod_seed.py: schema init failed: {e}", flush=True)
         traceback.print_exc()
         return
 
-    # Check if data already exists
+    # ── Step 3: Check if already seeded ──
     try:
         with get_db() as conn:
             row = conn.execute("SELECT COUNT(*) as c FROM sellers").fetchone()
@@ -46,8 +74,8 @@ def prod_seed():
         traceback.print_exc()
         return
 
+    # ── Step 4: Seed demo data ──
     print("prod_seed.py: first deploy — seeding demo data...", flush=True)
-
     try:
         from app.utils.helpers import make_id, now_iso, json_dumps
         from app.services import sellers, buyers, lots
@@ -63,6 +91,7 @@ def prod_seed():
         })
         seller_id = seller["seller_id"]
         sellers.verify_seller(seller_id, "APPROVED", "ops_admin")
+        print(f"prod_seed.py: seller created: {seller_id}", flush=True)
 
         buyer = buyers.register_buyer({
             "buyer_type": "ecom_reseller",
@@ -73,6 +102,7 @@ def prod_seed():
         })
         buyer_id = buyer["buyer_id"]
         buyers.verify_buyer(buyer_id, "APPROVED", "ops_admin")
+        print(f"prod_seed.py: buyer created: {buyer_id}", flush=True)
 
         buyers.create_intent_profile(buyer_id, {
             "profile_name": "Default",
@@ -102,6 +132,7 @@ def prod_seed():
                      p["department"], p["category_l1"], p["retail_price_cents"],
                      p["msrp_cents"], json_dumps(p.get("resale_data", {})), ts, ts),
                 )
+        print(f"prod_seed.py: {len(demo_products)} products created", flush=True)
 
         lot = lots.create_lot(seller_id, {
             "title": "Mixed Electronics — 100 units, 2 pallets",
@@ -120,8 +151,8 @@ def prod_seed():
             "ask_price_cents": 280000,
             "floor_price_cents": 220000,
         })
-
-        print(f"prod_seed.py: seeded seller={seller_id} buyer={buyer_id} lot={lot['lot_id']}", flush=True)
+        print(f"prod_seed.py: lot created and activated: {lot['lot_id']}", flush=True)
+        print(f"prod_seed.py: seed complete!", flush=True)
 
     except Exception as e:
         print(f"prod_seed.py: seed data failed (non-fatal): {e}", flush=True)
@@ -130,4 +161,4 @@ def prod_seed():
 
 if __name__ == "__main__":
     prod_seed()
-    print("prod_seed.py: done", flush=True)
+    print("prod_seed.py: exiting", flush=True)
