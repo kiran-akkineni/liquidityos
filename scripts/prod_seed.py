@@ -1,33 +1,37 @@
 """
 Production seed — idempotent setup for first deploy.
 Creates schema + demo data only if tables are empty.
-Run before gunicorn starts (via Dockerfile CMD).
+NEVER exits with error — gunicorn must start regardless.
 """
 
 import os
 import sys
-import logging
+import traceback
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    stream=sys.stderr,
-)
-logger = logging.getLogger("liquidityos.seed")
+print("prod_seed.py: starting", flush=True)
+print(f"prod_seed.py: DATABASE_URL={'set' if os.environ.get('DATABASE_URL') else 'not set'}", flush=True)
+print(f"prod_seed.py: PORT={os.environ.get('PORT', 'not set')}", flush=True)
 
 
 def prod_seed():
-    logger.info("Running production seed...")
+    try:
+        from app.db import init_db, get_db, is_postgres
+        print(f"prod_seed.py: using {'postgres' if is_postgres() else 'sqlite'}", flush=True)
+    except Exception as e:
+        print(f"prod_seed.py: FAILED to import db module: {e}", flush=True)
+        traceback.print_exc()
+        return
 
-    # Initialize schema first
-    from app.db import init_db, get_db, is_postgres
+    # Initialize schema
     try:
         init_db()
+        print("prod_seed.py: schema initialized", flush=True)
     except Exception as e:
-        logger.error("Schema init failed: %s", e, exc_info=True)
-        sys.exit(1)
+        print(f"prod_seed.py: schema init failed (will retry on app start): {e}", flush=True)
+        traceback.print_exc()
+        return
 
     # Check if data already exists
     try:
@@ -35,19 +39,19 @@ def prod_seed():
             row = conn.execute("SELECT COUNT(*) as c FROM sellers").fetchone()
             count = row["c"] if isinstance(row, dict) else row[0]
         if count > 0:
-            logger.info("Database already seeded (%d sellers) — skipping.", count)
+            print(f"prod_seed.py: already seeded ({count} sellers) — skipping", flush=True)
             return
     except Exception as e:
-        logger.error("Failed to check seed status: %s", e, exc_info=True)
-        sys.exit(1)
+        print(f"prod_seed.py: seed check failed: {e}", flush=True)
+        traceback.print_exc()
+        return
 
-    logger.info("First deploy — seeding demo data...")
-
-    from app.utils.helpers import make_id, now_iso, json_dumps
-    from app.services import sellers, buyers, lots
+    print("prod_seed.py: first deploy — seeding demo data...", flush=True)
 
     try:
-        # Demo seller
+        from app.utils.helpers import make_id, now_iso, json_dumps
+        from app.services import sellers, buyers, lots
+
         seller = sellers.register_seller({
             "seller_type": "liquidator",
             "business_name": "DemoSeller Inc",
@@ -60,7 +64,6 @@ def prod_seed():
         seller_id = seller["seller_id"]
         sellers.verify_seller(seller_id, "APPROVED", "ops_admin")
 
-        # Demo buyer
         buyer = buyers.register_buyer({
             "buyer_type": "ecom_reseller",
             "business_name": "DemoBuyer LLC",
@@ -71,7 +74,6 @@ def prod_seed():
         buyer_id = buyer["buyer_id"]
         buyers.verify_buyer(buyer_id, "APPROVED", "ops_admin")
 
-        # Buyer intent profile
         buyers.create_intent_profile(buyer_id, {
             "profile_name": "Default",
             "category_filters": {"include": ["electronics", "home_kitchen"]},
@@ -80,7 +82,6 @@ def prod_seed():
             "logistics": {"destination_zip": "75201"},
         })
 
-        # Canonical products
         ts = now_iso()
         demo_products = [
             {"upc": "012345678901", "asin": "B08N5WRWNW", "title": "Instant Pot Duo 7-in-1, 6 Quart", "brand_normalized": "Instant Pot", "department": "Home & Kitchen", "category_l1": "Kitchen & Dining", "retail_price_cents": 8999, "msrp_cents": 8999, "resale_data": {"amazon_fba": {"current_listing_price_cents": 7499}}},
@@ -102,7 +103,6 @@ def prod_seed():
                      p["msrp_cents"], json_dumps(p.get("resale_data", {})), ts, ts),
                 )
 
-        # Demo lot
         lot = lots.create_lot(seller_id, {
             "title": "Mixed Electronics — 100 units, 2 pallets",
             "description": "Demo lot with consumer electronics.",
@@ -121,12 +121,13 @@ def prod_seed():
             "floor_price_cents": 220000,
         })
 
-        logger.info("Demo data seeded: seller=%s, buyer=%s, lot=%s", seller_id, buyer_id, lot["lot_id"])
+        print(f"prod_seed.py: seeded seller={seller_id} buyer={buyer_id} lot={lot['lot_id']}", flush=True)
 
     except Exception as e:
-        logger.error("Seed failed: %s", e, exc_info=True)
-        sys.exit(1)
+        print(f"prod_seed.py: seed data failed (non-fatal): {e}", flush=True)
+        traceback.print_exc()
 
 
 if __name__ == "__main__":
     prod_seed()
+    print("prod_seed.py: done", flush=True)

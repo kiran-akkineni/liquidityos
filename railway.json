@@ -5,7 +5,7 @@
     "dockerfilePath": "Dockerfile"
   },
   "deploy": {
-    "startCommand": "python scripts/prod_seed.py && gunicorn --bind 0.0.0.0:${PORT:-8000} --workers 2 --timeout 120 app.main:app",
+    "startCommand": "python scripts/prod_seed.py; echo 'Starting gunicorn on port ${PORT:-8000}...'; gunicorn --bind 0.0.0.0:${PORT:-8000} --workers 2 --timeout 120 app.main:app",
     "restartPolicyType": "ON_FAILURE",
     "restartPolicyMaxRetries": 5
   }
