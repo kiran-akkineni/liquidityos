@@ -26,4 +26,4 @@ ENV PYTHONUNBUFFERED=1
 EXPOSE 8000
 
 # Use shell form so $PORT is expanded at runtime
-CMD python scripts/prod_seed.py && gunicorn --bind 0.0.0.0:$PORT --workers 2 --timeout 120 app.main:app
+CMD sh -c "python scripts/prod_seed.py && gunicorn --bind 0.0.0.0:${PORT:-8000} --workers 2 --timeout 120 app.main:app"
