@@ -1,4 +1,6 @@
-const API_BASE = '/v1';
+// In production (served by Flask), API is same-origin at /v1
+// In local dev (Vite), proxy handles /v1 → localhost:8000
+const API_BASE = (import.meta.env.VITE_API_URL || '') + '/v1';
 
 let opsToken = null;
 

@@ -9,13 +9,17 @@ import sys
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from flask import Flask
+from flask import Flask, send_from_directory
 from app.db import init_db
 from app.routes.api import api
 
+# Resolve frontend dist directory
+FRONTEND_DIST = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                              "frontend", "dist")
+
 
 def create_app(init_database=True):
-    app = Flask(__name__)
+    app = Flask(__name__, static_folder=None)
     app.config["JSON_SORT_KEYS"] = False
 
     # CORS — allow frontend dev server
@@ -26,8 +30,20 @@ def create_app(init_database=True):
         response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
         return response
 
-    # Register blueprints
+    # Register API blueprint
     app.register_blueprint(api)
+
+    # Serve frontend static files in production
+    if os.path.isdir(FRONTEND_DIST):
+        @app.route("/", defaults={"path": ""})
+        @app.route("/<path:path>")
+        def serve_frontend(path):
+            # Serve static assets if they exist
+            file_path = os.path.join(FRONTEND_DIST, path)
+            if path and os.path.isfile(file_path):
+                return send_from_directory(FRONTEND_DIST, path)
+            # SPA fallback — serve index.html for all other routes
+            return send_from_directory(FRONTEND_DIST, "index.html")
 
     # Global error handlers
     @app.errorhandler(400)
@@ -36,6 +52,13 @@ def create_app(init_database=True):
 
     @app.errorhandler(404)
     def not_found(e):
+        # If request is for API, return JSON 404
+        from flask import request
+        if request.path.startswith("/v1/"):
+            return {"error": {"code": "NOT_FOUND", "message": "Resource not found"}}, 404
+        # Otherwise serve SPA for client-side routing
+        if os.path.isdir(FRONTEND_DIST):
+            return send_from_directory(FRONTEND_DIST, "index.html")
         return {"error": {"code": "NOT_FOUND", "message": "Resource not found"}}, 404
 
     @app.errorhandler(405)
@@ -64,7 +87,7 @@ if __name__ == "__main__":
 ║     AI-Native B2B Wholesale Liquidation Infrastructure    ║
 ╠═══════════════════════════════════════════════════════════╣
 ║  API:   http://localhost:{port}/v1                          ║
-║  Docs:  See LiquidityOS_Sections_5-7 for full API spec   ║
+║  App:   http://localhost:{port}                             ║
 ╚═══════════════════════════════════════════════════════════╝
     """)
     app.run(host="0.0.0.0", port=port, debug=True)
